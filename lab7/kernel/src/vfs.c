@@ -1,0 +1,536 @@
+#include "vfs.h"
+#include "page_alloc.h"
+#include "str.h"
+#include "thread.h"
+struct mount* rootfs;//root file system
+struct filesystem fs_list[MAX_FS];//registered file systems
+static struct device dev_table[MAX_DEV];//records all device known, device has name and f_ops it use
+
+static struct filesystem tmpfs = {
+    .name = "tmpfs",
+    .setup_mount = tmpfs_setup_mount,//this func assigns fs field, allocate inode (and vnode) as DIR for root
+};
+static struct filesystem ramfs = {
+    .name = "ramfs",
+    .setup_mount = ramfs_setup_mount,
+};
+//given a path, return the node it point to through target
+static int resolve_path(const char* path,
+                        struct vnode** target,
+                        int follow_final_mount) {
+    struct task_struct* current = get_current();//get tp's task
+    struct vnode* node;
+    int i = 0;
+
+    if (!path || !target || !rootfs || !rootfs->root)
+        return -1;
+
+    //if path starts with '/', it is an absolute path, so start from current root.
+    //otherwise, it is relative path, so start from current working directory vnode.
+    if (path[0] == '/') {
+        //if current task exist and has root, use its root, else use rootfs's root
+        node = current && current->root ? current->root : rootfs->root;
+        i = 1;//skips /
+    } else {
+        //use cwd if has one, fallback to rootfs if none
+        node = current && current->cwd ? current->cwd : rootfs->root;
+        i = 0;
+    }
+
+    //If the starting vnode is a mount point, enter mounted filesystem.
+    while (node && node->mount)
+        node = node->mount->root;
+
+    //Empty path means current working directory.
+    if (path[0] == '\0') {
+        *target = node;
+        return 0;
+    }
+
+    //2. Split the path by '/', and walk vnode by vnode.
+    while (path[i] != '\0') {
+        char component[PATH_MAX];
+        int idx = 0;
+
+        //Skip slashes.
+        while (path[i] == '/')
+            i++;
+
+        //If path ends after skipping slashes, lookup is done.
+        if (path[i] == '\0')
+            break;
+
+        //build a component:
+        //copy a name before / to component, use array because path is set as const now
+        while (path[i] != '/' && path[i] != '\0') {
+            if (idx >= PATH_MAX - 1)
+                return -1;
+
+            component[idx++] = path[i++];
+        }
+        component[idx] = '\0';
+
+        //check current node can contain the component we found, only DIR node can contain other
+        if (!vfs_is_dir(node))
+            return -1;
+
+        // Skip ".".
+        if (strcmp(component, ".") == 0) {
+            continue;
+        }
+
+        // Handle "..".
+        // move to parent node
+        if (strcmp(component, "..") == 0) {
+            // If node is root of a mounted filesystem,
+            // ".." should return to parent of the mount point.
+            if (node->mounted_by && node->mounted_by->mountpoint) {//node is root, mounted_by points to mount object, has pointer to mountpoint
+                struct vnode* mountpoint = node->mounted_by->mountpoint;
+                //skip mountpoint and goes to its parent dir
+                if (mountpoint->parent)
+                    node = mountpoint->parent;//should go to parent of mount point, not mount point itself
+                else
+                    node = mountpoint;
+            } else if (node->parent) {//not root path
+                node = node->parent;
+            }
+
+            //case where mount point is also a dir, and one child is also mount point
+            while (node && node->mount)
+                node = node->mount->root;
+
+            continue;
+        }
+        //component is a name
+        if (!node->v_ops || !node->v_ops->lookup)//check function exists
+            return -1;
+
+        if (node->v_ops->lookup(node, &node, component) != 0)//tmpfs_lookup: find node under dir, return node addr
+            return -1;
+        //from now on node is the component
+        
+        //check if next component exists
+        int j = i;//i is 1 element after component
+        while (path[j] == '/')//skip /
+            j++;
+
+        int is_final_component = path[j] == '\0';//check if has next component
+
+        //if not final always enter mount, if final check flag (1 returns mount root, 0 returns mount point)
+        if (!is_final_component || follow_final_mount) {
+            while (node && node->mount)
+                node = node->mount->root;
+        }
+    }
+    //component followed by / must be a dir
+    if (i > 0 && path[i - 1] == '/' && !vfs_is_dir(node))
+        return -1;
+
+    *target = node;
+    return 0;
+}
+//on vfs_open(path, O_CREAT), vfs_mkdir(path)
+//takes a path where the final component may not exist, and splits it into parent + name, return parent vnode and name string
+static int resolve_parent(const char* pathname,
+                          struct vnode** parent,
+                          char* name) {
+    char dirname[PATH_MAX];
+    int len;
+    int slash;
+    int name_len;
+
+    if (!pathname || !parent || !name)
+        return -1;
+
+    len = strlen(pathname);
+
+    //remove trailing /'s
+    while (len > 0 && pathname[len - 1] == '/')
+        len--;
+
+    if (len == 0)//path is only slashes
+        return -1;
+
+    //find the last /
+    slash = len - 1;
+    while (slash >= 0 && pathname[slash] != '/')//loop allow slash to go -1, need for later check
+        slash--;
+    //len - (slash+1) (name starts after last slash)
+    name_len = len - slash - 1;
+
+    if (name_len <= 0 || name_len >= PATH_MAX)
+        return -1;
+    //build name array
+    for (int i = 0; i < name_len; i++)
+        name[i] = pathname[slash + 1 + i];
+    name[name_len] = '\0';
+    // .. and . is not legal name
+    if (strcmp(name, ".") == 0 || strcmp(name, "..") == 0)
+        return -1;
+    //slash would be the first slash pos before name
+    //no slash before, parent is cwd, name pathname (eg. file)
+    if (slash < 0) {
+        dirname[0] = '\0';
+    }
+    //slash is at start, parent is root dir (eg. /file)
+    else if (slash == 0) {
+        dirname[0] = '/';
+        dirname[1] = '\0';
+    }
+    //eg. "/a/b/file" -> dirname "/a/b"
+    else {
+        for (int i = 0; i < slash; i++)
+            dirname[i] = pathname[i];
+
+        dirname[slash] = '\0';
+    }
+
+    return vfs_lookup(dirname, parent);
+}
+
+int vfs_is_dir(struct vnode* node) {
+    if (!node || !node->v_ops || !node->v_ops->is_dir)
+        return 0;
+
+    return node->v_ops->is_dir(node);
+}
+
+void vfs_file_increment_refcount(struct file* file) {
+    if (file)
+        file->refcount++;
+}
+
+void vfs_init(void) {
+    int tmpfs_idx = register_filesystem(&tmpfs);
+    int uart_dev_id;
+    int fb_dev_id;
+    if (tmpfs_idx < 0)
+        return;
+
+    if (register_filesystem(&ramfs) < 0)
+        return;
+
+    rootfs = allocate(sizeof(struct mount));
+
+    if (!rootfs)
+        return;
+
+    memset(rootfs, 0, sizeof(struct mount));
+
+    fs_list[tmpfs_idx].setup_mount(&fs_list[tmpfs_idx], rootfs);
+
+    //get idx in device table
+    uart_dev_id = uartdev_init();//register uart in device table, return device table index
+    fb_dev_id = fbdev_init();
+
+    if (uart_dev_id < 0 || fb_dev_id < 0)
+        return;
+
+    if (vfs_mkdir("/dev") != 0)
+        return;
+
+    //create device vnodes using the IDs returned by register_device()
+    if (vfs_mknod("/dev/uart", uart_dev_id) != 0)
+        return;
+
+    if (vfs_mknod("/dev/fb", fb_dev_id) != 0)
+        return;
+    //mount ramfs file system in /ramfs
+    if (vfs_mkdir("/ramfs") != 0)//created under root of tmpfs
+        return;
+    //has set up root at this point, can use vfs interface to search/mount
+    if (vfs_mount("/ramfs", "ramfs") != 0)//vfs_mount also calls setup_mount for ramfs
+        return;
+}
+
+//find an empty entry in fs_list, and record new fs (only record, no mount)
+//return list index
+int register_filesystem(struct filesystem* fs) {
+    if (!fs)
+        return -1;
+
+    for (int i = 0; i < MAX_FS; i++) {
+        if (fs_list[i].name == 0) {
+            fs_list[i].name = fs->name;
+            fs_list[i].setup_mount = fs->setup_mount;
+            return i;
+        }
+    }
+
+    return -1;
+}
+
+//open a file by pathname, might need to create it first, output in target
+int vfs_open(const char* pathname, int flags, struct file** target) {
+    if (!pathname || !target)
+        return -1;
+
+    //relative allowed, no longer check first char need to be /
+    struct vnode* vnode = 0;
+
+    //if file not exist path
+    if (vfs_lookup(pathname, &vnode) != 0) {//not found pathname node, need to create it under parent
+        if (!(flags & O_CREAT))
+            return -1;
+
+        struct vnode* parent = 0;
+        char filename[PATH_MAX];
+
+        //split pathname into parent vnode and final file name
+        if (resolve_parent(pathname, &parent, filename) != 0)//return parent vnode, and file name
+            return -1;
+
+        //if the parent is a mount point, create inside mounted fs
+        while (parent && parent->mount)
+            parent = parent->mount->root;
+        //check is dir
+        if (!parent->v_ops || !parent->v_ops->is_dir || !parent->v_ops->is_dir(parent))
+            return -1;
+        //check has function
+        if (!parent->v_ops || !parent->v_ops->create)
+            return -1;
+
+        //allocate new vnode and inode, register entry under parent dir
+        if (parent->v_ops->create(parent, &vnode, filename) != 0)
+            return -1;
+    }
+
+    //would not fall into this check, left for safety
+    while (vnode->mount)
+        vnode = vnode->mount->root;
+
+    //default use vnode's f_ops ,if it is a device, use device f_ops instead
+    struct file_operations* f_ops = vnode->f_ops;
+    int dev_id;
+
+    //do not open directory as regular file
+    if (vfs_is_dir(vnode))
+        return -1;
+
+    //if vnode is device node, use the f_ops stored in device struct
+    if (vnode->v_ops &&
+        vnode->v_ops->get_dev_id &&
+        vnode->v_ops->get_dev_id(vnode, &dev_id) == 0) {
+        f_ops = get_device_fops(dev_id);
+    }
+
+    if (!f_ops || !f_ops->open)
+        return -1;
+    //allocate handler
+    *target = allocate(sizeof(struct file));
+    if (!(*target))
+        return -1;
+
+    (*target)->flags = flags;
+    (*target)->refcount = 1;//cause new handler
+    //the f_ops here is not from file, by type it chooses tmpfs, uartdev, fb, ramfs
+    if (f_ops->open(vnode, target) != 0) {//init handler, link to vnode of the file
+        free(*target);
+        *target = 0;
+        return -1;
+    }
+    //later f_ops uses what file stored
+    return 0;
+}
+
+
+int vfs_close(struct file* file) {
+    if (!file || !file->f_ops || !file->f_ops->close)
+        return -1;
+
+    file->refcount--;
+
+    if (file->refcount > 0)//if someone still using, do nothing
+        return 0;
+
+    return file->f_ops->close(file);//if no one using, free the file handler
+}
+
+int vfs_read(struct file* file, void* buf, size_t len) {
+    if (!file || !file->f_ops || !file->f_ops->read)
+        return -1;
+
+    return file->f_ops->read(file, buf, len);
+}
+
+int vfs_write(struct file* file, const void* buf, size_t len) {
+    if (!file || !file->f_ops || !file->f_ops->write)
+        return -1;
+
+    return file->f_ops->write(file, buf, len);
+}
+
+//given a path (/smth/smth1), find the vnode representing that file, return through target
+//part3, just wrapper for resolve_path
+int vfs_lookup(const char* pathname, struct vnode** target) {
+    return resolve_path(pathname, target, 1);
+}
+
+//create a directory by pathname
+int vfs_mkdir(const char* pathname) {
+    if (!pathname)
+        return -1;
+
+    struct vnode* vnode = 0;
+    struct vnode* parent = 0;
+    char new_dirname[PATH_MAX];
+
+    //if the path already exists, don't create duplicate dir
+    if (vfs_lookup(pathname, &vnode) == 0)
+        return -1;
+
+    //split pathname into parent vnode and new directory name
+    if (resolve_parent(pathname, &parent, new_dirname) != 0)
+        return -1;
+
+    //if the parent is a mount point, create inside mounted fs
+    while (parent && parent->mount)
+        parent = parent->mount->root;
+
+    if (!parent->v_ops || !parent->v_ops->is_dir || !parent->v_ops->is_dir(parent))
+        return -1;
+
+    if (!parent->v_ops || !parent->v_ops->mkdir)
+        return -1;
+
+    //allocate new dir vnode, copies name, register entry under parent dir
+    if (parent->v_ops->mkdir(parent, &vnode, new_dirname) != 0)
+        return -1;
+
+    return 0;
+}
+//create a device vnode at pathname
+int vfs_mknod(const char* pathname, int dev_id) {
+    struct vnode* vnode = 0;
+    struct vnode* parent = 0;
+    char name[PATH_MAX];
+
+    if (!pathname)
+        return -1;
+
+    if (dev_id <= 0 || !get_device_fops(dev_id))
+        return -1;
+
+    //check for duplicate
+    if (vfs_lookup(pathname, &vnode) == 0)
+        return -1;
+    //check dir path exist
+    if (resolve_parent(pathname, &parent, name) != 0)
+        return -1;
+
+    //if parent is mount point, create in mount root
+    while (parent && parent->mount)
+        parent = parent->mount->root;
+    //check is dir
+    if (!parent->v_ops || !parent->v_ops->is_dir || !parent->v_ops->is_dir(parent))
+        return -1;
+    //parent has mknod
+    if (!parent->v_ops->mknod)
+        return -1;
+    
+    return parent->v_ops->mknod(parent, &vnode, name, dev_id);//create under dir node, a vnode with name and dev_id 
+}
+
+
+//some design choice: for VFS API, user doesn't know pointer to vnode or filesystem, so it takes string and does conversion internally
+//takes existing dir node, modify mount field to a mount struct
+int vfs_mount(const char* target, const char* filesystem) {
+    if (!target || !filesystem)
+        return -1;
+    //pointer to filesystem
+    struct filesystem* fs = 0;
+
+    //find registered filesystem by name, in the fs_list
+    for (int i = 0; i < MAX_FS; i++) {
+        if (fs_list[i].name && strcmp(fs_list[i].name, filesystem) == 0) {
+            fs = &fs_list[i];
+            break;
+        }
+    }
+    //return error on not found
+    if (!fs)
+        return -1;
+
+    struct vnode* vnode = 0;//pointer to DIR vnode
+
+    //find the target vnode to mount on
+    if (resolve_path(target, &vnode, 0) != 0)//last argument: 0 will return mountpoint, 1 will return mount root (if last component is mountpoint)
+        return -1;
+
+    if (!vnode->v_ops || !vnode->v_ops->is_dir || !vnode->v_ops->is_dir(vnode))
+        return -1;
+
+    //do not mount again if this vnode is already a mount point
+    if (vnode->mount)
+        return -1;
+
+    //allocate for new mount object
+    struct mount* new_mount = allocate(sizeof(struct mount));
+    if (!new_mount)
+        return -1;
+
+    memset(new_mount, 0, sizeof(struct mount));
+
+    //setup this mounted filesystem, create its root vnode, fill the fields in mount
+    //calls the set up function recorded in the fs
+    //for root vnode
+    if (fs->setup_mount(fs, new_mount) != 0) {//allocate root vnode, link to mount
+        free(new_mount);
+        return -1;
+    }
+    //for mount point
+    ///records mount -> mountpoint, so .. can find its parent dir
+    new_mount->mountpoint = vnode;
+
+    if (new_mount->root) {
+        new_mount->root->mounted_by = new_mount;//redundant
+        //look up won't really use this
+        if (vnode->parent)
+            new_mount->root->parent = vnode->parent;//can do direct link back, but not really parent 
+        else
+            new_mount->root->parent = vnode;
+    }
+
+    //attach the new filesystem to this vnode
+    vnode->mount = new_mount;
+
+    return 0;
+}
+
+
+int register_device(const char* name, struct file_operations* f_ops) {
+    if (!name || !f_ops)
+        return -1;
+    //find one empty entry, register device with name, f_ops
+    for (int i = 1; i < MAX_DEV; i++) {
+        if (!dev_table[i].name) {
+            dev_table[i].name = name;
+            dev_table[i].f_ops = f_ops;
+            return i;
+        }
+    }
+
+    return -1;
+}
+
+//given device id, get device f_ops
+struct file_operations* get_device_fops(int dev_id) {
+    if (dev_id <= 0 || dev_id >= MAX_DEV)
+        return 0;
+
+    return dev_table[dev_id].f_ops;
+}
+//just check input and call underlying func
+long vfs_lseek64(struct file* file, long offset, int whence) {
+    if (!file || !file->f_ops || !file->f_ops->lseek64)
+        return -1;
+
+    return file->f_ops->lseek64(file, offset, whence);
+}
+//tmpfs/uart/ramfs would fail this
+int vfs_ioctl(struct file* file, unsigned long request, void* arg) {
+    if (!file || !file->f_ops || !file->f_ops->ioctl)
+        return -1;
+
+    return file->f_ops->ioctl(file, request, arg);
+}
